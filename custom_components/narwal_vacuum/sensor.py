@@ -1,0 +1,259 @@
+"""Sensor entities for Narwal vacuum."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfArea, UnitOfTime
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+
+from .narwal_client import NarwalState, WorkingStatus
+
+from . import NarwalConfigEntry
+from .coordinator import NarwalCoordinator
+from .entity import NarwalEntity
+
+
+@dataclass(frozen=True, kw_only=True)
+class NarwalSensorEntityDescription(SensorEntityDescription):
+    """Describes a Narwal sensor entity."""
+
+    value_fn: Callable[[NarwalState], float | str | None]
+
+
+SENSOR_DESCRIPTIONS: tuple[NarwalSensorEntityDescription, ...] = (
+    NarwalSensorEntityDescription(
+        key="battery",
+        device_class=SensorDeviceClass.BATTERY,
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        # battery_level comes from field 2 (real-time SOC as float32)
+        value_fn=lambda state: state.battery_level if state.battery_level > 0 else None,
+    ),
+    NarwalSensorEntityDescription(
+        key="cleaning_area",
+        translation_key="cleaning_area",
+        native_unit_of_measurement=UnitOfArea.SQUARE_METERS,
+        state_class=SensorStateClass.MEASUREMENT,
+        # Flow 2 broadcasts live area as float32 m² in ws.2. The legacy
+        # ws.13 cm² fallback was removed: it's a stale 18000 constant
+        # on Flow 2 and produced confusing 1.8 m² values. Models that
+        # don't populate ws.2 simply show "unknown" until that's
+        # mapped properly for them.
+        value_fn=lambda state: (
+            round(state.cleaning_area_m2, 2)
+            if state.cleaning_area_m2 > 0 else None
+        ),
+    ),
+    NarwalSensorEntityDescription(
+        key="cleaning_progress",
+        translation_key="cleaning_progress",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        # ws.1 as float32 — % of the active clean completed (Flow 2).
+        # Stays 0 outside an active clean, so we hide it then.
+        value_fn=lambda state: (
+            round(state.cleaning_progress_pct, 1)
+            if state.cleaning_progress_pct > 0 else None
+        ),
+    ),
+    NarwalSensorEntityDescription(
+        key="mop_drying_progress",
+        translation_key="mop_drying_progress",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        # ws.8 elapsed seconds / ws.9 target seconds.
+        # Hidden when no drying cycle is active (target == 0).
+        value_fn=lambda state: (
+            round(state.mop_drying_elapsed * 100 / state.mop_drying_target, 1)
+            if state.mop_drying_target > 0 else None
+        ),
+    ),
+    NarwalSensorEntityDescription(
+        key="user_action_seconds_left",
+        translation_key="user_action_seconds_left",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        # Time before the robot's user-action prompt times out.
+        # Hidden when no action is required.
+        value_fn=lambda state: (
+            max(state.user_action_target - state.user_action_elapsed, 0)
+            if state.user_action_type != 0 and state.user_action_target > 0
+            else None
+        ),
+    ),
+    NarwalSensorEntityDescription(
+        key="cleaning_time",
+        translation_key="cleaning_time",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.SECONDS,
+        state_class=SensorStateClass.MEASUREMENT,
+        # working_status field 3 is session elapsed seconds.
+        # NEEDS LIVE VALIDATION: only populated during active cleaning.
+        value_fn=lambda state: state.cleaning_time
+        if state.cleaning_time > 0
+        else None,
+    ),
+    NarwalSensorEntityDescription(
+        key="firmware_version",
+        translation_key="firmware_version",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda state: state.firmware_version or None,
+    ),
+    NarwalSensorEntityDescription(
+        key="dust_bag_health",
+        translation_key="dust_bag_health",
+        native_unit_of_measurement=PERCENTAGE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # robot_base_status field 41: 100 = bag healthy/empty, drops as full.
+        value_fn=lambda state: state.dust_bag_health or None,
+    ),
+    NarwalSensorEntityDescription(
+        key="error_code",
+        translation_key="error_code",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # 0 = no active error. Codes appear to be packed as
+        # 0xCC SS RR XX (category, subcategory, reserved, specific).
+        # Live-confirmed example: 16842807 (0x01010137) = clean-water
+        # tank empty / not installed during mop wash.
+        value_fn=lambda state: state.error_code or None,
+    ),
+    NarwalSensorEntityDescription(
+        key="error_message",
+        translation_key="error_message",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # Localized message string broadcast alongside the error code.
+        # Locale follows the robot's firmware setting (Chinese on the
+        # Flow 2 we tested) — prefer error_code for automations.
+        value_fn=lambda state: state.error_message or None,
+    ),
+)
+
+
+async def async_setup_entry(
+    hass: HomeAssistant,
+    entry: NarwalConfigEntry,
+    async_add_entities: AddConfigEntryEntitiesCallback,
+) -> None:
+    """Set up Narwal sensor entities."""
+    coordinator = entry.runtime_data
+    entities: list[SensorEntity] = [
+        NarwalSensor(coordinator, description) for description in SENSOR_DESCRIPTIONS
+    ]
+    entities.append(NarwalChargingStateSensor(coordinator))
+    entities.append(NarwalStationActivitySensor(coordinator))
+    async_add_entities(entities)
+
+
+class NarwalSensor(NarwalEntity, SensorEntity):
+    """A Narwal sensor entity."""
+
+    entity_description: NarwalSensorEntityDescription
+
+    def __init__(
+        self,
+        coordinator: NarwalCoordinator,
+        description: NarwalSensorEntityDescription,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self.entity_description = description
+        device_id = coordinator.config_entry.data["device_id"]
+        self._attr_unique_id = f"{device_id}_{description.key}"
+
+    @property
+    def native_value(self) -> float | str | None:
+        """Return the sensor value."""
+        state = self.coordinator.data
+        if state is None:
+            return None
+        return self.entity_description.value_fn(state)
+
+
+class NarwalChargingStateSensor(NarwalEntity, SensorEntity):
+    """Sensor showing charging state: Charging, Fully Charged, or unavailable."""
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_translation_key = "charging_state"
+    _attr_options = ["charging", "fully_charged", "not_charging"]
+
+    def __init__(self, coordinator: NarwalCoordinator) -> None:
+        """Initialize the charging state sensor."""
+        super().__init__(coordinator)
+        device_id = coordinator.config_entry.data["device_id"]
+        self._attr_unique_id = f"{device_id}_charging_state"
+
+    @property
+    def native_value(self) -> str | None:
+        """Return charging state.
+
+        Returns None (unavailable) when not docked.
+        """
+        state = self.coordinator.data
+        if state is None:
+            return None
+        if not state.is_docked:
+            return "not_charging"
+        if state.battery_level >= 100:
+            return "fully_charged"
+        return "charging"
+
+    @property
+    def icon(self) -> str:
+        """Return icon based on charging state."""
+        if self.native_value == "fully_charged":
+            return "mdi:battery"
+        if self.native_value == "charging":
+            return "mdi:battery-charging"
+        if self.native_value == "not_charging":
+            return "mdi:battery-off-outline"
+        return "mdi:battery-unknown"
+
+
+class NarwalStationActivitySensor(NarwalEntity, SensorEntity):
+    """Reports what the dock station is currently doing.
+
+    Derived from the robot's working_status. Distinct from the vacuum's
+    own activity because the station can run mop wash/dry cycles while
+    the robot itself is parked on it.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_translation_key = "station_activity"
+    _attr_options = ["idle", "mop_washing", "mop_drying", "dust_emptying"]
+    _attr_icon = "mdi:dishwasher"
+
+    def __init__(self, coordinator: NarwalCoordinator) -> None:
+        super().__init__(coordinator)
+        device_id = coordinator.config_entry.data["device_id"]
+        self._attr_unique_id = f"{device_id}_station_activity"
+
+    @property
+    def native_value(self) -> str | None:
+        state = self.coordinator.data
+        if state is None:
+            return None
+        # Mop wash takes priority — the robot is physically engaged
+        # with the basin so other activities can't really overlap.
+        if state.working_status == WorkingStatus.MOP_WASHING:
+            return "mop_washing"
+        if (
+            state.station_mop_drying
+            or state.working_status in (
+                WorkingStatus.MOP_DRYING, WorkingStatus.MOP_DRYING_ACTIVE,
+            )
+        ):
+            return "mop_drying"
+        if state.station_dust_emptying:
+            return "dust_emptying"
+        return "idle"
