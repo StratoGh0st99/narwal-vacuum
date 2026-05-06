@@ -39,17 +39,45 @@ class NarwalConfigFlow(ConfigFlow, domain=DOMAIN):
         # robot before the user starts the flow.
         self._discovered_host: str | None = None
 
-    async def _resolve_model(self, host: str, port: int) -> str | None:
-        """Probe the discovered host so the discovery card can show the
-        actual model name instead of just 'Narwal Vacuum'.
+    def _model_label_for_key(self, product_key: str) -> str:
+        """Reverse-look up a product_key in the user-facing model table."""
+        for label, key in NARWAL_MODELS.items():
+            if key == product_key:
+                return label
+        return f"Narwal {product_key}" if product_key else "Narwal Vacuum"
 
-        Best-effort: short timeout, swallow all errors. Returns the
-        human-friendly NARWAL_MODELS label, or None if probing fails.
+    def _existing_product_key_for_host(self, host: str) -> str | None:
+        """Reuse product_key from an earlier config entry that pointed
+        at this host — e.g. when the user is re-adding the robot
+        through discovery after a delete + reinstall."""
+        for entry in self._async_current_entries(include_ignore=False):
+            if entry.data.get("host") == host:
+                key = entry.data.get(CONF_PRODUCT_KEY)
+                if key:
+                    return key
+        return None
+
+    async def _resolve_model(self, host: str, port: int) -> str | None:
+        """Try to name the discovered model for the discovery card.
+
+        Cheapest path first — reuse an existing config entry's
+        product_key when this host has been configured before. Only
+        fall back to a live probe (which hangs if the robot is asleep
+        or someone else owns its single WebSocket slot) if we have
+        no cached info.
+
+        Best-effort: errors are swallowed, returns None on failure.
         """
+        cached = self._existing_product_key_for_host(host)
+        if cached:
+            return self._model_label_for_key(cached)
+
         client = NarwalClient(host=host, port=port)
         try:
             await client.connect()
-            await client.discover_device_id(timeout=5.0)
+            # Slightly longer than the user-step probe — a sleeping
+            # robot needs ~10 s to wake. Errors are still swallowed.
+            await client.discover_device_id(timeout=12.0)
             await client.drain_ws_buffer()
             info = await client.get_device_info()
         except Exception as ex:
@@ -57,11 +85,7 @@ class NarwalConfigFlow(ConfigFlow, domain=DOMAIN):
             return None
         finally:
             await client.disconnect()
-        # Reverse lookup product_key → label
-        for label, key in NARWAL_MODELS.items():
-            if key == info.product_key:
-                return label
-        return f"Narwal {info.product_key}" if info.product_key else None
+        return self._model_label_for_key(info.product_key)
 
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
