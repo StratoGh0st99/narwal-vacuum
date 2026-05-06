@@ -39,18 +39,41 @@ class NarwalConfigFlow(ConfigFlow, domain=DOMAIN):
         # robot before the user starts the flow.
         self._discovered_host: str | None = None
 
+    async def _resolve_model(self, host: str, port: int) -> str | None:
+        """Probe the discovered host so the discovery card can show the
+        actual model name instead of just 'Narwal Vacuum'.
+
+        Best-effort: short timeout, swallow all errors. Returns the
+        human-friendly NARWAL_MODELS label, or None if probing fails.
+        """
+        client = NarwalClient(host=host, port=port)
+        try:
+            await client.connect()
+            await client.discover_device_id(timeout=5.0)
+            await client.drain_ws_buffer()
+            info = await client.get_device_info()
+        except Exception as ex:
+            _LOGGER.debug("Discovery probe failed: %s", ex)
+            return None
+        finally:
+            await client.disconnect()
+        # Reverse lookup product_key → label
+        for label, key in NARWAL_MODELS.items():
+            if key == info.product_key:
+                return label
+        return f"Narwal {info.product_key}" if info.product_key else None
+
     async def async_step_zeroconf(
         self, discovery_info: ZeroconfServiceInfo
     ) -> ConfigFlowResult:
-        """Robot announces itself as `_narwal_sweeper._tcp` on the LAN.
-
-        Service info gives us the IP straight up; we let the existing
-        user step handle the rest so the user still picks the model.
-        """
+        """Robot announces itself as `_narwal_sweeper._tcp` on the LAN."""
         self._discovered_host = str(discovery_info.host)
         await self.async_set_unique_id(discovery_info.hostname.rstrip("."))
         self._abort_if_unique_id_configured(updates={"host": self._discovered_host})
+        # Probe quickly so the discovery card can name the actual model.
+        model = await self._resolve_model(self._discovered_host, DEFAULT_PORT)
         self.context["title_placeholders"] = {
+            "name": model or "Narwal Vacuum",
             "host": self._discovered_host,
         }
         return await self.async_step_user()
@@ -62,7 +85,9 @@ class NarwalConfigFlow(ConfigFlow, domain=DOMAIN):
         self._discovered_host = str(discovery_info.ip)
         await self.async_set_unique_id(discovery_info.hostname or self._discovered_host)
         self._abort_if_unique_id_configured(updates={"host": self._discovered_host})
+        model = await self._resolve_model(self._discovered_host, DEFAULT_PORT)
         self.context["title_placeholders"] = {
+            "name": model or "Narwal Vacuum",
             "host": self._discovered_host,
         }
         return await self.async_step_user()
